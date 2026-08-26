@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+#
+#  stripmeta — remove metadata from files
+#
+#  Strips embedded metadata (EXIF, XMP, IPTC, QuickTime, ID3, PDF and Office
+#  document properties…) via exiftool, plus the metadata that lives *outside*
+#  the file: macOS extended attributes and the filesystem timestamp.
+#
+#  MIT licensed. https://github.com/YOURNAME/stripmeta
+#
+
+set -uo pipefail
+
+VERSION="1.0.0"
+PROG="${0##*/}"
+
+# ─── output helpers ────────────────────────────────────────────────────────
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  B=$'\033[1m'; D=$'\033[2m'; R=$'\033[31m'; G=$'\033[32m'
+  Y=$'\033[33m'; C=$'\033[36m'; X=$'\033[0m'
+else
+  B=""; D=""; R=""; G=""; Y=""; C=""; X=""
+fi
+
+warn() { printf '%s %s\n' "${Y}warning:${X}" "$*" >&2; }
+err()  { printf '%s %s\n' "${R}error:${X}"   "$*" >&2; }
+die()  { err "$*"; exit 1; }
+
+usage() {
+  cat <<EOF
+${B}stripmeta${X} v$VERSION — remove metadata from files
+
+${B}USAGE${X}
+  $PROG [options] FILE [FILE...]
+
+${B}OPTIONS${X}
+  -i, --inplace     Overwrite the original instead of writing a copy.
+  -o, --out FILE    Write the cleaned result to FILE (single input only).
+  -k, --keep-date   Preserve the filesystem modification time. Default is to
+                    reset it to now, since the original mtime is metadata too.
+  -l, --list        Show all metadata found. Change nothing.
+  -n, --dry-run     Show what would be removed. Change nothing.
+  -q, --quiet       Only print errors.
+  -h, --help        This help.
+  -V, --version     Print version.
+
+${B}DEFAULT BEHAVIOUR${X}
+  Writes a cleaned copy next to the original:
+      photo.jpg  ->  photo_clean.jpg
+  The original is never modified unless you pass --inplace.
+
+${B}EXAMPLES${X}
+  $PROG abc.txt                  # -> abc_clean.txt
+  $PROG --inplace photo.jpg      # scrub photo.jpg in place
+  $PROG --list report.pdf        # just show what's in there
+  $PROG -n *.jpg                 # dry run across a folder
+  $PROG -o clean.mov raw.mov     # explicit output name
+
+${B}WHAT GETS REMOVED${X}
+  • Embedded tags        EXIF, XMP, IPTC, GPS, QuickTime, ID3, PDF Info,
+                         Office document properties, thumbnails, ICC…
+  • Extended attributes  Finder tags, download quarantine flag,
+                         "where from" URL, resource forks  (macOS)
+  • Filesystem mtime     reset to now, unless --keep-date
+
+  Structural properties — image dimensions, duration, codec, frame rate —
+  are part of the file format and necessarily remain.
+
+${B}REQUIRES${X}
+  exiftool    macOS:  brew install exiftool
+              Debian: sudo apt install libimage-exiftool-perl
+EOF
+}
+
+# ─── metadata inspection ───────────────────────────────────────────────────
+
+# Embedded tags, minus filesystem/tool noise and derived values.
+list_tags() {
+  exiftool -a -G1 -s -e --System:all --File:all --ExifTool:all -- "$1" 2>/dev/null
+}
+
+count_tags() {
+  local n; n=$(list_tags "$1" | grep -c .); printf '%s' "${n:-0}"
+}
+
+# Tags that identify a person, place, device or organisation — as opposed to
+# structural ones (ImageWidth, Duration, CompressorID) that describe the file
+# itself. Anchored at the start of the tag name so HandlerDescription is not
+# mistaken for Description.
+IDENTIFYING_RE='^(GPS|Artist|Author|By-line|Creator|Copyright|Rights|Owner|Software|CreatorTool|Make|Model|Lens|SerialNumber|CameraID|Comment|UserComment|Title|Subject|Keywords|Description|ImageDescription|Caption|Location|City|State|Country|Sublocation|Producer|LastModifiedBy|Company|Manager|HostComputer|Contact|Email|URL|WebStatement|DocumentID|InstanceID|OriginalDocumentID|History|Credit|Source|Writer|Editor|Person|Reel|Scene|Take|Marker)'
+
+# Tags whose names collide with the list above but describe the file's own
+# structure: SourceImageWidth is not the IPTC "Source" credit field, and
+# HandlerDescription is not a caption.
+STRUCTURAL_RE='^(SourceImage|SourceFile|HandlerDescription|HandlerClass|HandlerType|CompressorName|CompressorID|VendorID|MediaLanguage|TitleBar)'
+
+identifying_tags() {
+  list_tags "$1" | sed 's/^\[[^]]*\][[:space:]]*//' \
+    | grep -E "$IDENTIFYING_RE" | grep -Ev "$STRUCTURAL_RE"
+}
+
+count_identifying() {
+  local n; n=$(identifying_tags "$1" | grep -c .); printf '%s' "${n:-0}"
+}
+
+report_identifying() {
+  local hits; hits=$(identifying_tags "$1" | cut -c1-72)
+  [[ -n "$hits" ]] || return 0
+  printf '%s\n' "  ${Y}identifying:${X}"
+  printf '%s\n' "$hits" | sed "s/^/    ${D}·${X} /"
+}
+
+# ─── extended attributes ───────────────────────────────────────────────────
+
+# macOS sets and protects these; they hold no user data and cannot be deleted
+# from userland, so we neither count them nor fail because of them.
+XATTR_IGNORE='^(com\.apple\.provenance)$'
+
+xattr_list() {
+  { if command -v xattr >/dev/null 2>&1; then
+      xattr -- "$1" 2>/dev/null
+    elif command -v getfattr >/dev/null 2>&1; then
+      getfattr --absolute-names -- "$1" 2>/dev/null | sed -n 's/^\([^=]*\)=.*/\1/p'
+    fi
+  } | grep -Ev "$XATTR_IGNORE"
+}
+
+xattr_count() {
+  local n; n=$(xattr_list "$1" | grep -c .); printf '%s' "${n:-0}"
+}
+
+xattr_clear() {
+  if command -v xattr >/dev/null 2>&1; then
+    xattr -c -- "$1" 2>/dev/null
+  elif command -v setfattr >/dev/null 2>&1; then
+    local a
+    while IFS= read -r a; do
+      [[ -n "$a" ]] && setfattr -x "$a" -- "$1" 2>/dev/null
+    done < <(xattr_list "$1")
+  fi
+  return 0
+}
+
+# ─── argument parsing ──────────────────────────────────────────────────────
+inplace=0; keepdate=0; dryrun=0; listonly=0; quiet=0; outfile=""
+files=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -i|--inplace)   inplace=1 ;;
+    -k|--keep-date) keepdate=1 ;;
+    -n|--dry-run)   dryrun=1 ;;
+    -l|--list)      listonly=1 ;;
+    -q|--quiet)     quiet=1 ;;
+    -o|--out)       shift; [[ $# -gt 0 ]] || die "--out needs a filename"; outfile="$1" ;;
+    -h|--help)      usage; exit 0 ;;
+    -V|--version)   printf 'stripmeta %s\n' "$VERSION"; exit 0 ;;
+    --)             shift; while [[ $# -gt 0 ]]; do files+=("$1"); shift; done; break ;;
+    -*)             die "unknown option: $1  (try $PROG --help)" ;;
+    *)              files+=("$1") ;;
+  esac
+  shift
+done
+
+say() { [[ $quiet -eq 1 ]] || printf '%s\n' "$*"; }
+
+[[ ${#files[@]} -gt 0 ]] || { usage; exit 1; }
+
+command -v exiftool >/dev/null 2>&1 || die \
+"exiftool not found.
+  macOS:   brew install exiftool
+  Debian:  sudo apt install libimage-exiftool-perl"
+
+[[ -n "$outfile" && ${#files[@]} -gt 1 ]] && die "--out takes a single input file (got ${#files[@]})"
+[[ -n "$outfile" && $inplace -eq 1 ]]     && die "--out and --inplace are mutually exclusive"
+
+# ─── main loop ─────────────────────────────────────────────────────────────
+failed=0
+
+for src in "${files[@]}"; do
+
+  [[ -e "$src" ]]  || { err "no such file: $src";      failed=1; continue; }
+  [[ -d "$src" ]]  && { err "is a directory: $src";    failed=1; continue; }
+  [[ -f "$src" ]]  || { err "not a regular file: $src"; failed=1; continue; }
+  [[ -r "$src" ]]  || { err "not readable: $src";      failed=1; continue; }
+
+  before_tags=$(count_tags "$src")
+  before_id=$(count_identifying "$src")
+  before_xa=$(xattr_count "$src")
+
+  # ── --list ──────────────────────────────────────────────────────────────
+  if [[ $listonly -eq 1 ]]; then
+    say "${B}${src}${X}"
+    if [[ "$before_tags" -eq 0 ]]; then
+      say "  ${D}no embedded metadata${X}"
+    else
+      list_tags "$src" | sed 's/^/  /'
+    fi
+    if [[ "$before_xa" -gt 0 ]]; then
+      say "  ${B}extended attributes:${X}"
+      xattr_list "$src" | sed "s/^/    ${D}·${X} /"
+    fi
+    say ""
+    continue
+  fi
+
+  # ── --dry-run ───────────────────────────────────────────────────────────
+  if [[ $dryrun -eq 1 ]]; then
+    say "${B}${src}${X}"
+    say "  would remove: ${C}${before_tags}${X} embedded tag(s) (${C}${before_id}${X} identifying), ${C}${before_xa}${X} extended attribute(s)"
+    [[ $keepdate -eq 1 ]] || say "  would reset:  filesystem modification time"
+    [[ $inplace  -eq 1 ]] && say "  target:       ${D}$src (in place)${X}" \
+                          || say "  target:       ${D}a cleaned copy${X}"
+    report_identifying "$src"
+    say ""
+    continue
+  fi
+
+  # ── choose the target ───────────────────────────────────────────────────
+  if [[ $inplace -eq 1 ]]; then
+    [[ -w "$src" ]] || { err "not writable: $src"; failed=1; continue; }
+    dst="$src"
+  elif [[ -n "$outfile" ]]; then
+    dst="$outfile"
+    [[ -e "$dst" ]] && { err "output already exists: $dst"; failed=1; continue; }
+  else
+    dir=${src%/*}; [[ "$dir" == "$src" ]] && dir="."
+    base=${src##*/}
+    if [[ "$base" == *.* && "$base" != .* ]]; then
+      stem=${base%.*}; ext=".${base##*.}"
+    else
+      stem="$base"; ext=""
+    fi
+    dst="$dir/${stem}_clean${ext}"
+    n=2
+    while [[ -e "$dst" ]]; do dst="$dir/${stem}_clean-${n}${ext}"; n=$((n+1)); done
+  fi
+
+  orig_mtime=""
+  [[ $keepdate -eq 1 ]] && orig_mtime=$(date -r "$src" +%Y%m%d%H%M.%S 2>/dev/null || true)
+
+  # ── copy if needed ──────────────────────────────────────────────────────
+  if [[ "$dst" != "$src" ]]; then
+    cp -- "$src" "$dst" || { err "could not copy $src -> $dst"; failed=1; continue; }
+  fi
+
+  # ── strip embedded tags ─────────────────────────────────────────────────
+  # -P keeps exiftool's hands off the mtime; we set it ourselves below.
+  et_out=$(exiftool -all= -P -overwrite_original -- "$dst" 2>&1)
+  et_rc=$?
+
+  xattr_clear "$dst"
+
+  if [[ $keepdate -eq 1 && -n "$orig_mtime" ]]; then
+    touch -t "$orig_mtime" -- "$dst" 2>/dev/null
+  else
+    touch -- "$dst" 2>/dev/null
+  fi
+
+  # ── verify & report ─────────────────────────────────────────────────────
+  after_tags=$(count_tags "$dst")
+  after_id=$(count_identifying "$dst")
+  after_xa=$(xattr_count "$dst")
+
+  say "${B}${src}${X}"
+  [[ "$dst" != "$src" ]] && say "  ${D}->${X} ${B}${dst}${X}"
+
+  if [[ "$after_id" -eq 0 && "$after_xa" -eq 0 ]]; then
+    if [[ "$before_tags" -eq 0 && "$before_xa" -eq 0 ]]; then
+      say "  ${G}clean${X}  ${D}(nothing to remove)${X}"
+    else
+      removed=$(( before_tags - after_tags ))
+      say "  ${G}clean${X}  ${D}(removed ${removed} tag(s), ${before_xa} xattr(s))${X}"
+    fi
+    [[ "$after_tags" -gt 0 ]] && \
+      say "  ${D}${after_tags} structural tag(s) remain — dimensions, duration, codec${X}"
+  else
+    # exiftool refuses to write plain text and some other formats; that only
+    # matters if identifying tags actually survived.
+    if [[ "$after_id" -gt 0 ]] && \
+       { [[ $et_rc -ne 0 ]] || grep -qiE 'error|not (yet )?supported' <<<"$et_out"; }; then
+      warn "exiftool could not fully rewrite this format:"
+      printf '%s\n' "$et_out" | sed 's/^/    /' >&2
+    fi
+    say "  ${Y}partial${X} ${D}(${before_id} -> ${after_id} identifying tag(s), ${before_xa} -> ${after_xa} xattr(s))${X}"
+    report_identifying "$dst"
+    failed=1
+  fi
+done
+
+exit $failed
