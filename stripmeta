@@ -6,7 +6,8 @@
 #  document properties…) via exiftool, plus the metadata that lives *outside*
 #  the file: macOS extended attributes and the filesystem timestamp.
 #
-#  MIT licensed. https://github.com/YOURNAME/stripmeta
+#  MIT licensed. https://github.com/pingocreativetechnology/stripmeta
+#  Made by Pingo Creative Technology — https://www.pingocreativetechnology.com
 #
 
 set -uo pipefail
@@ -69,6 +70,8 @@ ${B}WHAT GETS REMOVED${X}
 ${B}REQUIRES${X}
   exiftool    macOS:  brew install exiftool
               Debian: sudo apt install libimage-exiftool-perl
+
+${D}Made by Pingo Creative Technology · https://www.pingocreativetechnology.com${X}
 EOF
 }
 
@@ -154,7 +157,7 @@ while [[ $# -gt 0 ]]; do
     -q|--quiet)     quiet=1 ;;
     -o|--out)       shift; [[ $# -gt 0 ]] || die "--out needs a filename"; outfile="$1" ;;
     -h|--help)      usage; exit 0 ;;
-    -V|--version)   printf 'stripmeta %s\n' "$VERSION"; exit 0 ;;
+    -V|--version)   printf 'stripmeta %s\nPingo Creative Technology · https://www.pingocreativetechnology.com\n' "$VERSION"; exit 0 ;;
     --)             shift; while [[ $# -gt 0 ]]; do files+=("$1"); shift; done; break ;;
     -*)             die "unknown option: $1  (try $PROG --help)" ;;
     *)              files+=("$1") ;;

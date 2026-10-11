@@ -168,4 +168,4 @@ gaps and gives you a copy-by-default workflow that's hard to lose data with.
 
 ## License
 
-MIT
+MIT © [Pingo Creative Technology](https://www.pingocreativetechnology.com)
