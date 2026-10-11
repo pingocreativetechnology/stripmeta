@@ -20,7 +20,7 @@ Requires [exiftool](https://exiftool.org).
 brew install exiftool          # macOS
 # sudo apt install libimage-exiftool-perl   # Debian/Ubuntu
 
-git clone https://github.com/YOURNAME/stripmeta.git
+git clone https://github.com/pingocreativetechnology/stripmeta.git
 cd stripmeta && ./install.sh
 ```
 
